@@ -707,6 +707,72 @@ func TestNewSecureChannel(t *testing.T) {
 
 const chunkedResponseTestTimeout = 2 * time.Second
 
+// TestOpenSecureChannelERRFReturnsStatusCode verifies that a server ERRF during
+// OpenSecureChannel is delivered as the server's StatusCode, not io.EOF.
+//
+// uacp.Conn.Receive already decodes ERR chunks, but readChunk used to treat the
+// empty payload as EOF and the dispatcher dropped the decoded error because ERR
+// has no request id. A server that rejects the handshake (untrusted client
+// certificate) answers with StatusBadSecurityChecksFailed and closes; Connect
+// must surface that status. See #613, #913.
+func TestOpenSecureChannelERRFReturnsStatusCode(t *testing.T) {
+	serverTCP, clientTCP := newTestTCPConnPair(t)
+	defer serverTCP.Close()
+	defer clientTCP.Close()
+
+	ack := &uacp.Acknowledge{
+		ReceiveBufSize: 64 * 1024,
+		SendBufSize:    64 * 1024,
+		MaxMessageSize: 2 * 1024 * 1024,
+		MaxChunkCount:  512,
+	}
+
+	serverConn, err := uacp.NewConn(serverTCP, ack)
+	require.NoError(t, err)
+	clientConn, err := uacp.NewConn(clientTCP, ack)
+	require.NoError(t, err)
+
+	serverDone := make(chan error, 1)
+	go func() {
+		// Wait for the client's OpenSecureChannel (OPN) so the ERRF is a
+		// handshake reply, then abort the connection the way a rejecting
+		// server does.
+		if _, err := serverConn.Receive(); err != nil {
+			serverDone <- err
+			return
+		}
+		serverConn.SendError(ua.StatusBadSecurityChecksFailed)
+		_ = serverConn.Close()
+		serverDone <- nil
+	}()
+
+	cfg := &Config{
+		SecurityPolicyURI: ua.SecurityPolicyURINone,
+		SecurityMode:      ua.MessageSecurityModeNone,
+		RequestTimeout:    2 * time.Second,
+		Lifetime:          60000,
+	}
+	sc, err := NewSecureChannel("opc.tcp://127.0.0.1/test", clientConn, cfg, make(chan error, 1))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), chunkedResponseTestTimeout)
+	defer cancel()
+
+	err = sc.Open(ctx)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, io.EOF, "Open must not hide the server ERR behind io.EOF, got %v", err)
+	require.ErrorIs(t, err, ua.StatusBadSecurityChecksFailed, "Open must return the ERR StatusCode, got %v", err)
+
+	select {
+	case serr := <-serverDone:
+		require.NoError(t, serr)
+	case <-time.After(chunkedResponseTestTimeout):
+		t.Fatal("timed out waiting for test server")
+	}
+
+	_ = sc.Close()
+}
+
 func TestSendResponseWithContextWritesAllChunks(t *testing.T) {
 	// Use a real TCP pair here so we exercise the exact chunk framing that a
 	// peer would see on the wire, not just the internal message encoder.
