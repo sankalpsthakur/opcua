@@ -290,6 +290,14 @@ func (s *SecureChannel) dispatcher() {
 			ch, ok := s.popHandler(msg.RequestID)
 
 			if !ok {
+				// ERR chunks and other transport failures have no request id, so
+				// popHandler misses. Fan the error out to every in-flight caller
+				// instead of dropping it and later surfacing a bare io.EOF.
+				if msg.Err != nil {
+					debug.Printf("uasc %d/%d: no handler for error, notifying callers: %v", s.c.ID(), msg.RequestID, msg.Err)
+					s.notifyCallers(msg.Err)
+					continue
+				}
 				debug.Printf("uasc %d/%d: no handler for %T", s.c.ID(), msg.RequestID, msg.body)
 				continue
 			}
@@ -437,13 +445,15 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	// read a full message from the underlying conn.
 	b, err := s.c.Receive()
-	if err == io.EOF || len(b) == 0 {
-		return nil, io.EOF
-	}
-	// do not wrap this error since it hides conn error
+	// Receive returns (nil, *uacp.Error) for an ERR chunk. Check that before
+	// treating an empty buffer as EOF, otherwise handshake refusals such as
+	// StatusBadSecurityChecksFailed are discarded (#613, #913).
 	var uacperr *uacp.Error
 	if errors.As(err, &uacperr) {
 		return nil, err
+	}
+	if err == io.EOF || len(b) == 0 {
+		return nil, io.EOF
 	}
 	if err != nil {
 		return nil, errors.Errorf("sechan: read header failed: %s %#v", err, err)
@@ -936,7 +946,21 @@ func (s *SecureChannel) sendRequestWithTimeout(
 		return ctx.Err()
 	case <-s.disconnected:
 		s.popHandler(reqID)
-		return io.EOF
+		// notifyCallers may already have delivered the transport error (for
+		// example an ERR StatusCode) before the dispatcher exited. Prefer that
+		// over a generic io.EOF from the closed connection.
+		select {
+		case msg := <-ch:
+			if msg.Err != nil {
+				if msg.Response() != nil {
+					_ = h(msg.Response()) // ignore result because msg.Err takes precedence
+				}
+				return msg.Err
+			}
+			return h(msg.Response())
+		default:
+			return io.EOF
+		}
 	case msg := <-ch:
 		if msg.Err != nil {
 			if msg.Response() != nil {
@@ -948,6 +972,27 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	case <-timer.C:
 		s.popHandler(reqID)
 		return ua.StatusBadTimeout
+	}
+}
+
+// notifyCallers delivers a connection-level error to every pending request
+// handler. ERR chunks have no matching request id, so the dispatcher cannot
+// route them through popHandler.
+func (s *SecureChannel) notifyCallers(err error) {
+	s.handlersMu.Lock()
+	pending := make(map[uint32]chan *MessageBody, len(s.handlers))
+	for reqID, ch := range s.handlers {
+		pending[reqID] = ch
+		delete(s.handlers, reqID)
+	}
+	s.handlersMu.Unlock()
+
+	for reqID, ch := range pending {
+		select {
+		case ch <- &MessageBody{RequestID: reqID, Err: err}:
+		default:
+			debug.Printf("uasc %d/%d: unexpected state. channel write should always succeed.", s.c.ID(), reqID)
+		}
 	}
 }
 
